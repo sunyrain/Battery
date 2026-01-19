@@ -527,6 +527,7 @@ def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
     生成演示预测图
     
     展示从不同初始 cycle 出发的预测轨迹
+    使用潜空间距离变化来可视化退化趋势（而不是未训练的 health_head）
     """
     logger.info("=" * 60)
     logger.info("生成演示预测图")
@@ -541,52 +542,164 @@ def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     max_cycle = cycles.max().item()
+    min_cycle = cycles.min().item()
+    total_cycles = max_cycle - min_cycle
+    
+    # 计算早期和晚期参考点
+    early_threshold = min_cycle + total_cycles * 0.1
+    late_threshold = min_cycle + total_cycles * 0.9
+    
+    early_mask = cycles <= early_threshold
+    late_mask = cycles >= late_threshold
+    
+    early_indices = torch.where(early_mask)[0]
+    late_indices = torch.where(late_mask)[0]
+    
+    if len(early_indices) == 0 or len(late_indices) == 0:
+        logger.warning("  没有足够的早期/晚期样本")
+        return
+    
+    # 计算参考点
+    early_center = latent_vectors[early_indices].mean(dim=0, keepdim=True).to(device)
+    late_center = latent_vectors[late_indices].mean(dim=0, keepdim=True).to(device)
     
     # 选择不同阶段的起点
     percentiles = [0.1, 0.3, 0.5, 0.7]
     colors = ['blue', 'green', 'orange', 'red']
     
+    # 计算早期到晚期的参考距离
+    ref_dist = torch.norm(early_center - late_center).item()
+    
     for ax_idx, (pct, color) in enumerate(zip(percentiles, colors)):
         ax = axes[ax_idx // 2, ax_idx % 2]
         
-        target_cycle = cycles.min().item() + (max_cycle - cycles.min().item()) * pct
+        target_cycle = min_cycle + total_cycles * pct
         idx = (torch.abs(cycles - target_cycle)).argmin().item()
         start_cycle = cycles[idx].item()
         
         z_0 = latent_vectors[idx:idx+1].to(device)
         
         # 预测轨迹
-        t_start = start_cycle / max_cycle
+        t_start = (start_cycle - min_cycle) / total_cycles
         t_span = torch.linspace(t_start, 1.0, 100, device=device)
-        trajectory = model.predict_trajectory(z_0, t_span)
         
-        # 计算健康评分
-        health_scores = []
+        with torch.no_grad():
+            trajectory = model.predict_trajectory(z_0, t_span)
+        
+        # 计算退化指标：基于到晚期中心的距离变化
+        # 退化程度 = (初始到晚期距离 - 当前到晚期距离) / 参考距离
+        degradation_scores = []
+        initial_dist_to_late = torch.norm(z_0 - late_center).item()
+        
         for z_t in trajectory:
-            score = model.health_head(z_t).squeeze().item()
-            health_scores.append(score)
+            dist_to_late = torch.norm(z_t - late_center).item()
+            dist_to_early = torch.norm(z_t - early_center).item()
+            
+            # 计算相对位置：0 = 接近早期, 1 = 接近晚期
+            # 使用距离比例
+            total_dist = dist_to_early + dist_to_late + 1e-6
+            degradation = dist_to_early / total_dist  # 越接近晚期，dist_to_early 越大
+            
+            degradation_scores.append(degradation)
         
-        predicted_cycles = t_span.cpu().numpy() * max_cycle
+        predicted_cycles = t_span.cpu().numpy() * total_cycles + min_cycle
         
-        ax.plot(predicted_cycles, health_scores, color=color, linewidth=2, 
+        ax.plot(predicted_cycles, degradation_scores, color=color, linewidth=2, 
                 label=f'From Cycle {int(start_cycle)}')
         ax.axhline(y=0.8, color='gray', linestyle='--', alpha=0.5, label='Failure Threshold')
         ax.axvline(x=start_cycle, color=color, linestyle=':', alpha=0.5)
         
         ax.set_xlabel('Cycle')
-        ax.set_ylabel('Health Score (Degradation)')
+        ax.set_ylabel('Degradation Level')
         ax.set_title(f'Starting from Cycle {int(start_cycle)} ({pct:.0%} of lifecycle)')
         ax.set_ylim(-0.05, 1.05)
         ax.legend()
         ax.grid(True, alpha=0.3)
     
-    plt.suptitle('Flow Matching Lifecycle Predictions', fontsize=14)
+    plt.suptitle('Flow Matching Lifecycle Predictions (Latent Space Distance)', fontsize=14)
     plt.tight_layout()
     
     save_path = Path('experiments/flow_matching/validation')
     save_path.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path / 'lifecycle_predictions.png', dpi=150, bbox_inches='tight')
     logger.info(f"  预测图已保存: {save_path / 'lifecycle_predictions.png'}")
+    plt.close()
+    
+    # 额外生成一个轨迹对比图
+    _generate_trajectory_comparison(model, latent_vectors, cycles, device, save_path)
+
+
+def _generate_trajectory_comparison(model, latent_vectors, cycles, device, save_path):
+    """生成轨迹对比图：真实 vs 预测"""
+    try:
+        import matplotlib.pyplot as plt
+        from sklearn.decomposition import PCA
+    except ImportError:
+        return
+    
+    # PCA 降维
+    pca = PCA(n_components=2)
+    latent_2d = pca.fit_transform(latent_vectors.cpu().numpy())
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    max_cycle = cycles.max().item()
+    min_cycle = cycles.min().item()
+    total_cycles = max_cycle - min_cycle
+    
+    # 左图：真实潜空间分布
+    ax1 = axes[0]
+    scatter = ax1.scatter(latent_2d[:, 0], latent_2d[:, 1], c=cycles.numpy(), 
+                          cmap='viridis', alpha=0.6, s=20)
+    plt.colorbar(scatter, ax=ax1, label='Cycle')
+    ax1.set_xlabel('PC1')
+    ax1.set_ylabel('PC2')
+    ax1.set_title('True Latent Space Distribution')
+    ax1.grid(True, alpha=0.3)
+    
+    # 右图：预测轨迹
+    ax2 = axes[1]
+    ax2.scatter(latent_2d[:, 0], latent_2d[:, 1], c='lightgray', alpha=0.3, s=10, label='True samples')
+    
+    # 从几个起点预测轨迹
+    colors = ['red', 'blue', 'green', 'purple']
+    start_pcts = [0.1, 0.3, 0.5, 0.7]
+    
+    for start_pct, color in zip(start_pcts, colors):
+        target_cycle = min_cycle + total_cycles * start_pct
+        idx = (torch.abs(cycles - target_cycle)).argmin().item()
+        start_cycle = cycles[idx].item()
+        
+        z_0 = latent_vectors[idx:idx+1].to(device)
+        
+        t_start = (start_cycle - min_cycle) / total_cycles
+        t_span = torch.linspace(t_start, 1.0, 50, device=device)
+        
+        with torch.no_grad():
+            trajectory = model.predict_trajectory(z_0, t_span)
+        
+        # 转换到 2D
+        if isinstance(trajectory, torch.Tensor):
+            traj_np = trajectory.squeeze(1).cpu().numpy()
+        else:
+            traj_np = torch.stack(trajectory).squeeze(1).cpu().numpy()
+        traj_2d = pca.transform(traj_np)
+        
+        ax2.plot(traj_2d[:, 0], traj_2d[:, 1], color=color, linewidth=2, 
+                 label=f'Pred from Cycle {int(start_cycle)}')
+        ax2.scatter(traj_2d[0, 0], traj_2d[0, 1], color=color, s=100, marker='o', edgecolors='black')
+        ax2.scatter(traj_2d[-1, 0], traj_2d[-1, 1], color=color, s=100, marker='*', edgecolors='black')
+    
+    ax2.set_xlabel('PC1')
+    ax2.set_ylabel('PC2')
+    ax2.set_title('Predicted Trajectories in Latent Space')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.suptitle('Latent Space: True Distribution vs Predicted Trajectories', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(save_path / 'trajectory_comparison.png', dpi=150, bbox_inches='tight')
+    logger.info(f"  轨迹对比图已保存: {save_path / 'trajectory_comparison.png'}")
     plt.close()
 
 
