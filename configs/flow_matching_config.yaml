@@ -10,10 +10,10 @@ model:
   
   # 速度场网络
   velocity_net:
-    hidden_dim: 512
-    time_embed_dim: 128
-    cond_embed_dim: 128
-    num_layers: 6
+    hidden_dim: 256        # 从512减小到256，减少计算量
+    time_embed_dim: 64     # 从128减小到64
+    cond_embed_dim: 64     # 从128减小到64
+    num_layers: 4          # 从6减小到4层
     dropout: 0.1
     use_adaln: true
     use_skip_connections: true
@@ -26,15 +26,15 @@ model:
   
   # ODE 求解器
   solver:
-    type: "dopri5"  # euler, midpoint, rk4, dopri5, adaptive_heun
-    rtol: 1.0e-5
-    atol: 1.0e-5
+    type: "euler"          # 改用简单的euler，训练快很多！推理时可换回dopri5
+    rtol: 1.0e-3           # 放宽精度要求
+    atol: 1.0e-3
   
   # 路径类型
   path_type: "linear"  # linear, vp, spherical
   
   # 是否使用轻量级网络
-  lightweight: false
+  lightweight: true        # 启用轻量级网络，大幅减少参数量
   
   # 最大 cycle 数
   max_cycle: 200
@@ -98,8 +98,8 @@ data:
 # ============================================================
 training:
   # 基本设置
-  batch_size: 32
-  num_epochs: 100
+  batch_size: 64           # 增大batch_size，利用GPU并行
+  num_epochs: 1
   num_workers: 4
   
   # 优化器

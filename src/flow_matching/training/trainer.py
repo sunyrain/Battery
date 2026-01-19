@@ -454,10 +454,12 @@ class FlowMatchingTrainer:
                     self._save_checkpoint('best_model.pt')
             
             # 日志
+            val_loss = val_metrics.get('val_loss')
+            val_loss_str = f"{val_loss:.4f}" if isinstance(val_loss, float) else "N/A"
             logger.info(
                 f"Epoch {epoch+1}/{self.config.num_epochs} - "
                 f"Loss: {epoch_loss:.4f} - "
-                f"Val Loss: {val_metrics.get('val_loss', 'N/A'):.4f if isinstance(val_metrics.get('val_loss'), float) else 'N/A'} - "
+                f"Val Loss: {val_loss_str} - "
                 f"Time: {epoch_time:.1f}s"
             )
             

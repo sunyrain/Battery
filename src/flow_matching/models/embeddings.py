@@ -63,18 +63,20 @@ class SinusoidalTimeEmbedding(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            t: 时间张量, shape [...] 或 [..., 1], 值域 [0, 1]
+            t: 时间张量, shape [batch] 或 [batch, 1] 或标量, 值域 [0, 1]
         
         Returns:
-            时间嵌入, shape [..., embed_dim]
+            时间嵌入, shape [batch, embed_dim]
         """
-        # 确保 t 是正确的形状
+        # 确保 t 至少是 1 维的
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        if t.dim() >= 1 and t.shape[-1] == 1:
+        
+        # 如果是 [batch, 1]，squeeze 成 [batch]
+        if t.dim() == 2 and t.shape[-1] == 1:
             t = t.squeeze(-1)
         
-        # 扩展维度用于广播: [batch, 1] * [half_dim] -> [batch, half_dim]
+        # 现在 t 是 [batch]，扩展维度用于广播: [batch, 1] * [half_dim] -> [batch, half_dim]
         t_scaled = t.unsqueeze(-1) * self.freqs * self.scale
         
         # 正弦/余弦嵌入

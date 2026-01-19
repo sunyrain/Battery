@@ -449,12 +449,22 @@ class LightweightVelocityNetwork(nn.Module):
         
         Args:
             z_t: [batch, latent_dim]
-            t: [batch] 或 [batch, 1]
+            t: [batch] 或 [batch, 1] 或标量
             condition: 未使用，保持接口一致
         
         Returns:
             velocity: [batch, latent_dim]
         """
+        # 确保 t 是正确的形状 [batch]
+        if t.dim() == 0:
+            t = t.unsqueeze(0).expand(z_t.shape[0])
+        elif t.dim() == 2:
+            t = t.squeeze(-1)
+        
         t_emb = self.time_embed(t)
         x = torch.cat([z_t, t_emb], dim=-1)
         return self.net(x)
+
+    def get_num_params(self) -> int:
+        """返回参数总数"""
+        return sum(p.numel() for p in self.parameters())

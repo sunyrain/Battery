@@ -74,9 +74,12 @@ class ODEFunction(nn.Module):
         """
         self.nfe += 1
         
-        # 扩展 t 到 batch 维度
+        # 扩展 t 到 batch 维度 [batch]
         batch_size = z.shape[0]
-        t_batch = t.expand(batch_size)
+        if t.dim() == 0:
+            t_batch = t.unsqueeze(0).expand(batch_size)
+        else:
+            t_batch = t.expand(batch_size)
         
         return self.velocity_fn(z, t_batch, self.condition)
     
