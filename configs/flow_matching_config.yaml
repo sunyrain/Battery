@@ -1,0 +1,187 @@
+# Battery Flow Matching 配置文件
+# 用于电池潜空间分布迁移模型训练
+
+# ============================================================
+# 模型配置
+# ============================================================
+model:
+  # 潜空间维度 (需与 SmartWave Encoder 输出一致)
+  latent_dim: 128
+  
+  # 速度场网络
+  velocity_net:
+    hidden_dim: 512
+    time_embed_dim: 128
+    cond_embed_dim: 128
+    num_layers: 6
+    dropout: 0.1
+    use_adaln: true
+    use_skip_connections: true
+  
+  # 条件嵌入
+  condition:
+    num_battery_types: 10
+    num_c_rates: 20
+    continuous_dim: 2  # 例如: 温度, SOC
+  
+  # ODE 求解器
+  solver:
+    type: "dopri5"  # euler, midpoint, rk4, dopri5, adaptive_heun
+    rtol: 1.0e-5
+    atol: 1.0e-5
+  
+  # 路径类型
+  path_type: "linear"  # linear, vp, spherical
+  
+  # 是否使用轻量级网络
+  lightweight: false
+  
+  # 最大 cycle 数
+  max_cycle: 200
+
+# ============================================================
+# 编码器配置 (SmartWave)
+# ============================================================
+encoder:
+  # 预训练权重路径
+  checkpoint_path: "latest.pth"
+  
+  # 是否冻结编码器
+  freeze: true
+  
+  # SmartWave 配置
+  smartwave:
+    input_dim: 1
+    d_model: 128
+    nhead: 4
+    num_layers: 2
+    max_level: 6
+    wavelet: "sym4"
+    patch_size: 50
+    stride: 50
+
+# ============================================================
+# 数据配置
+# ============================================================
+data:
+  # 数据根目录 (CSV中的路径已包含Data/前缀，故此处设为空)
+  data_root: ""
+  
+  # 数据集配置
+  dataset:
+    csv_path: "Data/LiCu_10C-1/LiCu_10C_1.csv"
+    signal_length: 3000  # 每个信号的采样点数
+    
+    # 配对采样策略
+    pairing:
+      # 最小 cycle 差
+      min_cycle_gap: 10
+      # 最大 cycle 差
+      max_cycle_gap: 100
+      # 是否使用所有可能的配对
+      use_all_pairs: false
+  
+  # 潜空间缓存 (加速训练)
+  cache:
+    enabled: true
+    cache_dir: "experiments/flow_matching/latent_cache"
+  
+  # 数据增强
+  augmentation:
+    # 时间抖动
+    time_jitter: 0.01
+    # 噪声注入
+    noise_scale: 0.001
+
+# ============================================================
+# 训练配置
+# ============================================================
+training:
+  # 基本设置
+  batch_size: 32
+  num_epochs: 100
+  num_workers: 4
+  
+  # 优化器
+  optimizer:
+    type: "adamw"
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  
+  # 学习率调度
+  scheduler:
+    type: "cosine"  # cosine, linear, constant, warmup_cosine
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  
+  # 梯度裁剪
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+  
+  # EMA (指数移动平均)
+  ema:
+    enabled: true
+    decay: 0.9999
+  
+  # 检查点
+  checkpoint:
+    save_dir: "experiments/flow_matching/checkpoints"
+    save_every: 10  # 每 N 个 epoch 保存
+    keep_last: 5    # 保留最近 N 个检查点
+  
+  # 日志
+  logging:
+    log_dir: "experiments/flow_matching/logs"
+    log_every: 100  # 每 N 步记录
+    use_wandb: false
+    wandb_project: "battery-flow-matching"
+
+# ============================================================
+# 评估配置
+# ============================================================
+evaluation:
+  # 评估频率
+  eval_every: 5  # 每 N 个 epoch 评估
+  
+  # 轨迹预测
+  trajectory:
+    num_steps: 100
+    visualize: true
+    save_plots: true
+  
+  # 健康评分预测
+  health_score:
+    evaluate: true
+  
+  # Wasserstein 距离
+  wasserstein:
+    evaluate: true
+    num_samples: 1000
+
+# ============================================================
+# 推理配置
+# ============================================================
+inference:
+  # 默认求解器步数
+  num_steps: 50
+  
+  # 是否使用 EMA 模型
+  use_ema: true
+  
+  # 批处理大小
+  batch_size: 64
+
+# ============================================================
+# 实验配置
+# ============================================================
+experiment:
+  name: "battery_flow_v1"
+  seed: 42
+  device: "cuda"  # cuda, cpu, auto
+  
+  # 混合精度训练
+  mixed_precision:
+    enabled: true
+    dtype: "float16"  # float16, bfloat16

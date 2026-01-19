@@ -1,0 +1,8 @@
+{
+  "csv_path": "Data/LiCu_10C-1/LiCu_10C_1.csv",
+  "data_root": "",
+  "num_samples": 1313,
+  "latent_dim": 256,
+  "min_cycle": 1,
+  "max_cycle": 97
+}

@@ -1,0 +1,22 @@
+{
+  "csv_path": "Data/LiCu_10C-1/LiCu_10C_1.csv",
+  "path_statistics": {
+    "before_path_unique_count": 1,
+    "after_path_unique_count": 1313,
+    "total_unique_paths": 1314,
+    "valid_files": 1314,
+    "invalid_files": 0
+  },
+  "data_statistics": {
+    "total_data_points": 3942000,
+    "mean": 0.0006470891901472945,
+    "std": 0.1880206477009387,
+    "min": -0.74632,
+    "max": 0.68598,
+    "variance": 0.03535176396188051
+  },
+  "files_status": {
+    "missing_files": [],
+    "error_files": []
+  }
+}
