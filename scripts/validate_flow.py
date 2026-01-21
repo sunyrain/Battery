@@ -17,6 +17,7 @@ import sys
 import argparse
 import logging
 import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -31,6 +32,40 @@ from src.smartwavev9 import DeltaBatteryModel
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class PretrainedScorer:
+    """
+    使用 latest.pth 预训练的 output_head 计算退化分数
+    
+    4 个类别: 0=健康, 1=轻度退化, 2=中度退化, 3=严重退化/失效
+    退化分数 = 加权平均: sum(prob_i * weight_i)
+    """
+    def __init__(self, encoder: torch.nn.Module, device: torch.device):
+        self.output_head = encoder.output_head
+        self.output_head.to(device)
+        self.output_head.eval()
+        self.device = device
+        # 类别权重: 0->0, 1->0.33, 2->0.67, 3->1.0
+        self.weights = torch.tensor([0.0, 0.33, 0.67, 1.0], device=device)
+    
+    @torch.no_grad()
+    def score(self, z: torch.Tensor) -> float:
+        """计算单个潜向量的退化分数 [0, 1]"""
+        z = z.to(self.device)
+        logits = self.output_head(z)
+        probs = F.softmax(logits, dim=-1)
+        score = (probs * self.weights).sum(dim=-1)
+        return score.item() if score.dim() == 0 else score.squeeze().item()
+    
+    @torch.no_grad()
+    def score_batch(self, z: torch.Tensor) -> torch.Tensor:
+        """批量计算退化分数"""
+        z = z.to(self.device)
+        logits = self.output_head(z)
+        probs = F.softmax(logits, dim=-1)
+        scores = (probs * self.weights).sum(dim=-1)
+        return scores
 
 
 def load_encoder(checkpoint_path: str, device: torch.device):
@@ -110,7 +145,7 @@ def load_flow_model(checkpoint_path: str, encoder: torch.nn.Module, latent_dim: 
         cond_embed_dim=cond_embed_dim,
         time_embed_dim=time_embed_dim,
         num_layers=4,
-        max_cycle=200,
+        max_cycle=100,
         lightweight=True,
     )
     
@@ -145,15 +180,33 @@ def load_flow_model(checkpoint_path: str, encoder: torch.nn.Module, latent_dim: 
 
 
 @torch.no_grad()
-def validate_trajectory_reconstruction(model, latent_vectors, cycles, num_samples=100, device='cuda'):
+def validate_trajectory_reconstruction(model, latent_vectors, cycles, num_samples=100, device='cuda', max_cycle=100, true_end_of_life=None):
     """
     验证 1: 轨迹重建质量
     
-    对于随机采样的 (z_0, z_1) 对，从 z_0 积分到 t=1，检查是否接近 z_1
+    对于随机采样的 (z_0, z_1) 对，从 t_0 积分到 t_1，检查是否接近 z_1
+    
+    关键修正: 使用正确的时间范围 [t_0, t_1] 而不是 [0, 1]
+    - t_0 = (cycle_0 - 1) / (max_cycle - 1)
+    - t_1 = (cycle_1 - 1) / (max_cycle - 1)
+    
+    Args:
+        true_end_of_life: 电池真实寿命终点，只采样 <= 该值的 cycle
     """
     logger.info("=" * 60)
     logger.info("验证 1: 轨迹重建质量")
     logger.info("=" * 60)
+    
+    # 如果指定了真实寿命，过滤数据
+    if true_end_of_life is not None:
+        valid_life_mask = cycles <= true_end_of_life
+        latent_vectors = latent_vectors[valid_life_mask]
+        cycles = cycles[valid_life_mask]
+        logger.info(f"  使用真实寿命范围: cycle <= {true_end_of_life}")
+        logger.info(f"  有效样本数: {len(cycles)}")
+    
+    def cycle_to_t(cycle):
+        return (cycle - 1) / (max_cycle - 1)
     
     n = len(cycles)
     errors = []
@@ -164,8 +217,8 @@ def validate_trajectory_reconstruction(model, latent_vectors, cycles, num_sample
         idx_0 = np.random.randint(n)
         cycle_0 = cycles[idx_0].item()
         
-        # 找一个较晚的 cycle
-        valid_mask = (cycles - cycle_0 >= 10) & (cycles - cycle_0 <= 50)
+        # 找一个较晚的 cycle (间隔 5-30，适应较短寿命)
+        valid_mask = (cycles - cycle_0 >= 5) & (cycles - cycle_0 <= 30)
         valid_indices = torch.where(valid_mask)[0]
         
         if len(valid_indices) == 0:
@@ -177,10 +230,17 @@ def validate_trajectory_reconstruction(model, latent_vectors, cycles, num_sample
         z_0 = latent_vectors[idx_0:idx_0+1].to(device)
         z_1 = latent_vectors[idx_1:idx_1+1].to(device)
         
-        # 积分预测
-        t_span = torch.linspace(0, 1, 50, device=device)
+        # 计算正确的时间范围
+        t_0 = cycle_to_t(cycle_0)
+        t_1 = cycle_to_t(cycle_1)
+        
+        # 从 t_0 积分到 t_1 (而不是 0 到 1)
+        num_steps = max(10, int((t_1 - t_0) * 50))  # 根据时间跨度调整步数
+        t_span = torch.linspace(t_0, t_1, num_steps, device=device)
+        
+        # 使用条件预测: 给定 z_0 在 t_0，预测 t_1 时刻的状态
         trajectory = model.predict_trajectory(z_0, t_span)
-        z_pred = trajectory[-1]  # 最终预测
+        z_pred = trajectory[-1]  # t_1 时刻的预测
         
         # 计算误差
         error = torch.norm(z_pred - z_1).item()
@@ -207,7 +267,7 @@ def validate_trajectory_reconstruction(model, latent_vectors, cycles, num_sample
 
 
 @torch.no_grad()
-def validate_health_score_curve(model, latent_vectors, cycles, num_samples=20, device='cuda'):
+def validate_health_score_curve(model, latent_vectors, cycles, scorer, num_samples=20, device='cuda', max_cycle=100, true_end_of_life=None):
     """
     验证 2: 健康评分曲线
     
@@ -215,20 +275,35 @@ def validate_health_score_curve(model, latent_vectors, cycles, num_samples=20, d
     1. 单调递增 (退化应该越来越严重)
     2. 范围在 [0, 1] 内
     3. 早期 cycle 评分低，晚期 cycle 评分高
+    
+    Args:
+        scorer: PretrainedScorer 实例
+        true_end_of_life: 电池真实寿命终点
     """
     logger.info("=" * 60)
     logger.info("验证 2: 健康评分曲线 (单调性 & 物理意义)")
     logger.info("=" * 60)
     
+    # 如果指定了真实寿命，过滤数据
+    if true_end_of_life is not None:
+        valid_life_mask = cycles <= true_end_of_life
+        latent_vectors = latent_vectors[valid_life_mask]
+        cycles = cycles[valid_life_mask]
+        logger.info(f"  使用真实寿命范围: cycle <= {true_end_of_life}")
+    
     monotonic_count = 0
     valid_range_count = 0
     early_late_correct = 0
     
-    # 获取早期和晚期的 cycle
+    # 获取早期和晚期的 cycle (基于真实寿命)
     min_cycle = cycles.min().item()
-    max_cycle = cycles.max().item()
-    early_threshold = min_cycle + (max_cycle - min_cycle) * 0.2
-    late_threshold = min_cycle + (max_cycle - min_cycle) * 0.8
+    end_cycle = true_end_of_life if true_end_of_life else cycles.max().item()
+    early_threshold = min_cycle + (end_cycle - min_cycle) * 0.2
+    late_threshold = min_cycle + (end_cycle - min_cycle) * 0.8
+    
+    # 计算真实寿命对应的归一化时间
+    t_end_of_life = (end_cycle - 1) / (max_cycle - 1)
+    logger.info(f"  预测范围: t ∈ [0, {t_end_of_life:.3f}] (cycle 1 → {end_cycle})")
     
     for _ in range(num_samples):
         # 随机选择一个早期样本
@@ -240,14 +315,14 @@ def validate_health_score_curve(model, latent_vectors, cycles, num_samples=20, d
         idx = early_indices[np.random.randint(len(early_indices))].item()
         z_0 = latent_vectors[idx:idx+1].to(device)
         
-        # 预测轨迹
-        t_span = torch.linspace(0, 1, 100, device=device)
+        # 预测轨迹 (只预测到真实寿命终点，而非 t=1)
+        t_span = torch.linspace(0, t_end_of_life, 100, device=device)
         trajectory = model.predict_trajectory(z_0, t_span)
         
-        # 计算健康评分
+        # 使用预训练评分器计算健康评分
         health_scores = []
         for z_t in trajectory:
-            score = model.health_head(z_t).squeeze().item()
+            score = scorer.score(z_t)
             health_scores.append(score)
         
         health_scores = np.array(health_scores)
@@ -366,40 +441,43 @@ def validate_latent_space_structure(model, latent_vectors, cycles, device='cuda'
 
 
 @torch.no_grad()
-def validate_rul_prediction(model, latent_vectors, cycles, num_samples=50, device='cuda'):
+def validate_rul_prediction(model, latent_vectors, cycles, scorer, num_samples=50, device='cuda', max_cycle=100, true_end_of_life=None):
     """
     验证 4: RUL 预测精度
     
     RUL (Remaining Useful Life) 预测方法:
     1. 给定当前 cycle 的潜向量 z_current
     2. 使用 Flow Model 预测未来轨迹
-    3. 通过比较预测轨迹与已知晚期样本的相似度，估计到达退化状态的 cycle
+    3. 使用预训练评分器找到 score >= 0.8 的点作为失效点
     4. 与真实的剩余 cycle 比较
+    
+    Args:
+        scorer: PretrainedScorer 实例
+        true_end_of_life: 电池真实寿命终点，用于计算真实 RUL
     """
     logger.info("=" * 60)
     logger.info("验证 4: RUL (剩余寿命) 预测能力")
     logger.info("=" * 60)
     
-    max_cycle = cycles.max().item()
+    # 如果指定了真实寿命，过滤数据
+    if true_end_of_life is not None:
+        valid_life_mask = cycles <= true_end_of_life
+        latent_vectors = latent_vectors[valid_life_mask]
+        cycles = cycles[valid_life_mask]
+        logger.info(f"  使用真实寿命: {true_end_of_life} cycles")
+    
     min_cycle = cycles.min().item()
-    total_cycles = max_cycle - min_cycle
+    # 使用真实寿命作为终点
+    end_of_life = true_end_of_life if true_end_of_life else cycles.max().item()
+    total_cycles = end_of_life - min_cycle
     
-    # 获取晚期样本作为参考 (最后 10% 的 cycle)
-    late_threshold = min_cycle + total_cycles * 0.9
-    late_mask = cycles >= late_threshold
-    late_indices = torch.where(late_mask)[0]
+    # 使用 health_head 预测失效阈值
+    FAILURE_THRESHOLD = 0.99  # health_head 输出 >= 0.99 认为失效
+    logger.info(f"  失效阈值: health_score >= {FAILURE_THRESHOLD}")
     
-    if len(late_indices) < 5:
-        logger.warning("  没有足够的晚期样本作为参考")
-        return {}
-    
-    # 计算晚期样本的平均潜向量作为 "失效状态" 参考
-    late_vectors = latent_vectors[late_indices].to(device)
-    late_center = late_vectors.mean(dim=0, keepdim=True)
-    
-    # 选择中间阶段的样本作为测试 (30% - 70%)
-    mid_start = min_cycle + total_cycles * 0.3
-    mid_end = min_cycle + total_cycles * 0.7
+    # 选择早中期阶段的样本作为测试 (20% - 60%)
+    mid_start = min_cycle + total_cycles * 0.2
+    mid_end = min_cycle + total_cycles * 0.6
     
     test_mask = (cycles >= mid_start) & (cycles <= mid_end)
     test_indices = torch.where(test_mask)[0]
@@ -418,71 +496,64 @@ def validate_rul_prediction(model, latent_vectors, cycles, num_samples=50, devic
         current_cycle = cycles[idx].item()
         z_0 = latent_vectors[idx:idx+1].to(device)
         
-        # 真实 RUL (到最大观测 cycle)
-        true_rul = max_cycle - current_cycle
+        # 真实 RUL (到寿命终点)
+        true_rul = end_of_life - current_cycle
         
         if true_rul <= 0:
             continue
         
         # 使用 Flow Model 预测未来轨迹
-        # 从当前归一化时间 t_current 预测到 t=1
-        t_current = (current_cycle - min_cycle) / total_cycles
+        # 从当前归一化时间 t_current 预测到寿命终点 t_end
+        t_current = (current_cycle - 1) / (max_cycle - 1)  # 使用 max_cycle=100 归一化
+        t_end = (end_of_life - 1) / (max_cycle - 1)  # 寿命终点对应的归一化时间
         num_steps = 100
-        t_span = torch.linspace(t_current, 1.0, num_steps, device=device)
+        t_span = torch.linspace(t_current, t_end, num_steps, device=device)
         
         with torch.no_grad():
             trajectory = model.predict_trajectory(z_0, t_span)
         
-        # 计算轨迹上每个点到晚期中心的距离
-        distances = []
+        # 使用预训练评分器计算轨迹上每个点的健康评分
+        health_scores = []
         for z_t in trajectory:
-            dist = torch.norm(z_t - late_center, dim=-1).item()
-            distances.append(dist)
+            score = scorer.score(z_t)
+            health_scores.append(score)
         
-        distances = np.array(distances)
-        initial_dist = distances[0]
+        health_scores = np.array(health_scores)
         
-        # 找到距离开始明显减小的点 (接近晚期状态)
-        # 使用相对于初始距离的比例
-        if initial_dist > 0:
-            relative_distances = distances / initial_dist
-        else:
-            relative_distances = distances
-        
-        # 预测失效点: 当相对距离下降到某个阈值 (如 0.3，即接近晚期状态)
-        failure_threshold = 0.5  # 当距离减少到 50% 时认为接近失效
-        
-        # 找到第一个满足条件的点
+        # 找到第一个达到失效阈值的点
         predicted_failure_idx = None
-        for i, rel_dist in enumerate(relative_distances):
-            if rel_dist < failure_threshold:
+        for i, score in enumerate(health_scores):
+            if score >= FAILURE_THRESHOLD:
                 predicted_failure_idx = i
                 break
         
         if predicted_failure_idx is not None:
             # 计算预测的失效时间
             predicted_failure_t = t_span[predicted_failure_idx].item()
-            predicted_failure_cycle = min_cycle + predicted_failure_t * total_cycles
+            # t 转换回 cycle: cycle = t * (max_cycle - 1) + 1
+            predicted_failure_cycle = predicted_failure_t * (max_cycle - 1) + 1
             predicted_rul = predicted_failure_cycle - current_cycle
         else:
-            # 如果没有到达失效阈值，使用轨迹终点作为估计
-            # 根据距离衰减趋势外推
-            if len(distances) >= 2 and distances[-1] < distances[0]:
-                # 计算衰减速率
-                decay_rate = (distances[0] - distances[-1]) / (len(distances) - 1)
-                if decay_rate > 0:
-                    # 估计还需要多少步到达失效
-                    remaining_dist = distances[-1] - (initial_dist * failure_threshold)
-                    if remaining_dist > 0:
-                        extra_steps = remaining_dist / decay_rate
-                        extra_cycles = extra_steps / num_steps * (1.0 - t_current) * total_cycles
+            # 如果没有到达失效阈值，根据健康评分趋势外推
+            if len(health_scores) >= 2 and health_scores[-1] > health_scores[0]:
+                # 计算增长速率
+                score_rate = (health_scores[-1] - health_scores[0]) / (len(health_scores) - 1)
+                if score_rate > 0:
+                    # 估计还需要多少步到达失效阈值
+                    remaining_score = FAILURE_THRESHOLD - health_scores[-1]
+                    if remaining_score > 0:
+                        extra_steps = remaining_score / score_rate
+                        # 每步对应的 cycle 增量
+                        t_step = (t_span[-1] - t_span[0]).item() / (num_steps - 1)
+                        extra_t = extra_steps * t_step
+                        extra_cycles = extra_t * (max_cycle - 1)
                         predicted_rul = true_rul + extra_cycles
                     else:
                         predicted_rul = true_rul * 0.9  # 快到了
                 else:
-                    predicted_rul = true_rul * 1.5  # 衰减很慢，可能还有更长寿命
+                    predicted_rul = true_rul * 1.5  # 评分不增长，可能还有更长寿命
             else:
-                # 没有明显衰减趋势，可能模型没学好，使用平均估计
+                # 没有明显增长趋势
                 predicted_rul = true_rul * 1.2
         
         # 确保预测值合理
@@ -522,12 +593,15 @@ def validate_rul_prediction(model, latent_vectors, cycles, num_samples=50, devic
     return {}
 
 
-def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
+def generate_demo_prediction(model, latent_vectors, cycles, scorer, device='cuda'):
     """
     生成演示预测图
     
     展示从不同初始 cycle 出发的预测轨迹
-    使用潜空间距离变化来可视化退化趋势（而不是未训练的 health_head）
+    使用预训练评分器计算退化分数
+    
+    Args:
+        scorer: PretrainedScorer 实例
     """
     logger.info("=" * 60)
     logger.info("生成演示预测图")
@@ -545,30 +619,9 @@ def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
     min_cycle = cycles.min().item()
     total_cycles = max_cycle - min_cycle
     
-    # 计算早期和晚期参考点
-    early_threshold = min_cycle + total_cycles * 0.1
-    late_threshold = min_cycle + total_cycles * 0.9
-    
-    early_mask = cycles <= early_threshold
-    late_mask = cycles >= late_threshold
-    
-    early_indices = torch.where(early_mask)[0]
-    late_indices = torch.where(late_mask)[0]
-    
-    if len(early_indices) == 0 or len(late_indices) == 0:
-        logger.warning("  没有足够的早期/晚期样本")
-        return
-    
-    # 计算参考点
-    early_center = latent_vectors[early_indices].mean(dim=0, keepdim=True).to(device)
-    late_center = latent_vectors[late_indices].mean(dim=0, keepdim=True).to(device)
-    
     # 选择不同阶段的起点
     percentiles = [0.1, 0.3, 0.5, 0.7]
     colors = ['blue', 'green', 'orange', 'red']
-    
-    # 计算早期到晚期的参考距离
-    ref_dist = torch.norm(early_center - late_center).item()
     
     for ax_idx, (pct, color) in enumerate(zip(percentiles, colors)):
         ax = axes[ax_idx // 2, ax_idx % 2]
@@ -586,21 +639,8 @@ def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
         with torch.no_grad():
             trajectory = model.predict_trajectory(z_0, t_span)
         
-        # 计算退化指标：基于到晚期中心的距离变化
-        # 退化程度 = (初始到晚期距离 - 当前到晚期距离) / 参考距离
-        degradation_scores = []
-        initial_dist_to_late = torch.norm(z_0 - late_center).item()
-        
-        for z_t in trajectory:
-            dist_to_late = torch.norm(z_t - late_center).item()
-            dist_to_early = torch.norm(z_t - early_center).item()
-            
-            # 计算相对位置：0 = 接近早期, 1 = 接近晚期
-            # 使用距离比例
-            total_dist = dist_to_early + dist_to_late + 1e-6
-            degradation = dist_to_early / total_dist  # 越接近晚期，dist_to_early 越大
-            
-            degradation_scores.append(degradation)
+        # 使用预训练评分器计算退化分数
+        degradation_scores = [scorer.score(z_t) for z_t in trajectory]
         
         predicted_cycles = t_span.cpu().numpy() * total_cycles + min_cycle
         
@@ -616,7 +656,7 @@ def generate_demo_prediction(model, latent_vectors, cycles, device='cuda'):
         ax.legend()
         ax.grid(True, alpha=0.3)
     
-    plt.suptitle('Flow Matching Lifecycle Predictions (Latent Space Distance)', fontsize=14)
+    plt.suptitle('Flow Matching Lifecycle Predictions (Pretrained Scorer)', fontsize=14)
     plt.tight_layout()
     
     save_path = Path('experiments/flow_matching/validation')
@@ -719,11 +759,16 @@ def main():
     logger.info("加载 Encoder...")
     encoder, latent_dim = load_encoder(args.encoder_checkpoint, device)
     
-    # 2. 加载 Flow Matching 模型
+    # 2. 创建预训练评分器 (使用 latest.pth 的 output_head)
+    logger.info("创建预训练评分器...")
+    scorer = PretrainedScorer(encoder, device)
+    logger.info("  ✓ 使用 latest.pth 的 output_head 进行退化评分")
+    
+    # 3. 加载 Flow Matching 模型
     logger.info("加载 Flow Matching 模型...")
     model, config = load_flow_model(args.checkpoint, encoder, latent_dim, device)
     
-    # 3. 加载潜空间缓存
+    # 4. 加载潜空间缓存
     logger.info("加载潜空间缓存...")
     cache_dir = Path(args.cache_dir)
     if not (cache_dir / 'latent_vectors.pt').exists():
@@ -738,21 +783,28 @@ def main():
     logger.info(f"加载 {len(latent_vectors)} 个潜向量")
     logger.info(f"Cycle 范围: {cycles.min().item()} - {cycles.max().item()}")
     
-    # 4. 运行验证
+    # 5. 运行验证
     logger.info("\n" + "=" * 60)
     logger.info("开始 Flow Matching 模型验证")
     logger.info("=" * 60 + "\n")
     
     results = {}
     
-    # 验证 1: 轨迹重建
+    # 电池真实寿命 (根据数据确定)
+    TRUE_END_OF_LIFE = 54  # LiCu_10C 电池的真实寿命是 54 cycles
+    logger.info(f"电池真实寿命: {TRUE_END_OF_LIFE} cycles")
+    logger.info(f"时间归一化: max_cycle=100")
+    
+    # 验证 1: 轨迹重建 (使用 max_cycle=100，只采样真实寿命内的数据)
     results['reconstruction'] = validate_trajectory_reconstruction(
-        model, latent_vectors, cycles, num_samples=100, device=device
+        model, latent_vectors, cycles, num_samples=100, device=device, 
+        max_cycle=100, true_end_of_life=TRUE_END_OF_LIFE
     )
     
-    # 验证 2: 健康曲线
+    # 验证 2: 健康曲线 (预测范围: cycle 1 → 54，使用预训练评分器)
     results['health_curve'] = validate_health_score_curve(
-        model, latent_vectors, cycles, num_samples=20, device=device
+        model, latent_vectors, cycles, scorer, num_samples=100, device=device,
+        max_cycle=100, true_end_of_life=TRUE_END_OF_LIFE
     )
     
     # 验证 3: 潜空间结构
@@ -760,13 +812,14 @@ def main():
         model, latent_vectors, cycles, device=device
     )
     
-    # 验证 4: RUL 预测
+    # 验证 4: RUL 预测 (使用预训练评分器)
     results['rul'] = validate_rul_prediction(
-        model, latent_vectors, cycles, num_samples=50, device=device
+        model, latent_vectors, cycles, scorer, num_samples=100, device=device,
+        max_cycle=100, true_end_of_life=TRUE_END_OF_LIFE
     )
     
-    # 生成演示图
-    generate_demo_prediction(model, latent_vectors, cycles, device=device)
+    # 生成演示图 (使用预训练评分器)
+    generate_demo_prediction(model, latent_vectors, cycles, scorer, device=device)
     
     # 总结
     logger.info("\n" + "=" * 60)

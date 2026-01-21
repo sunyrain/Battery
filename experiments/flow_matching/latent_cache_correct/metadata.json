@@ -1,0 +1,9 @@
+{
+  "csv_path": "Data/LiCu_10C-1/LiCu_10C_1_R_simple.csv",
+  "num_samples": 201,
+  "latent_dim": 256,
+  "min_cycle": 1,
+  "max_cycle": 54,
+  "normalize_mean": 0.0014818326526033054,
+  "normalize_std": 0.15278572162321524
+}

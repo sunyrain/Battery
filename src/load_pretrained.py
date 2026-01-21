@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 import torch
 import torch.nn as nn
 
-from src.model.predict.smartwavev9 import DeltaBatteryModel, create_battery_model_from_config
+from src.smartwavev9 import DeltaBatteryModel, create_battery_model_from_config
 
 
 def load_pretrained_model(

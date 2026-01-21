@@ -1,187 +1,152 @@
 # Battery Flow Matching 配置文件
 # 用于电池潜空间分布迁移模型训练
+# 
+# ⚠️ 重要：确保数据和归一化参数与 SelfLearning 训练一致！
 
 # ============================================================
 # 模型配置
 # ============================================================
 model:
-  # 潜空间维度 (需与 SmartWave Encoder 输出一致)
-  latent_dim: 128
+  latent_dim: 256
   
-  # 速度场网络
   velocity_net:
-    hidden_dim: 256        # 从512减小到256，减少计算量
-    time_embed_dim: 64     # 从128减小到64
-    cond_embed_dim: 64     # 从128减小到64
-    num_layers: 4          # 从6减小到4层
+    hidden_dim: 256
+    time_embed_dim: 64
+    cond_embed_dim: 64
+    num_layers: 4
     dropout: 0.1
     use_adaln: true
     use_skip_connections: true
   
-  # 条件嵌入
   condition:
     num_battery_types: 10
     num_c_rates: 20
-    continuous_dim: 2  # 例如: 温度, SOC
+    continuous_dim: 2
   
-  # ODE 求解器
   solver:
-    type: "euler"          # 改用简单的euler，训练快很多！推理时可换回dopri5
-    rtol: 1.0e-3           # 放宽精度要求
+    type: "euler"
+    rtol: 1.0e-3
     atol: 1.0e-3
   
-  # 路径类型
-  path_type: "linear"  # linear, vp, spherical
+  path_type: "linear"
+  lightweight: true
   
-  # 是否使用轻量级网络
-  lightweight: true        # 启用轻量级网络，大幅减少参数量
+  # Cycle 范围（统一设置为100）
+  max_cycle: 100
   
-  # 最大 cycle 数
-  max_cycle: 200
+  # 失效阈值
+  failure_threshold: 0.95
 
 # ============================================================
 # 编码器配置 (SmartWave)
 # ============================================================
 encoder:
-  # 预训练权重路径
   checkpoint_path: "latest.pth"
-  
-  # 是否冻结编码器
   freeze: true
   
-  # SmartWave 配置
   smartwave:
     input_dim: 1
-    d_model: 128
+    d_model: 256
     nhead: 4
-    num_layers: 2
+    num_layers: 1
+    ROPE_max_len: 5000
+    num_classes: 4
     max_level: 6
     wavelet: "sym4"
-    patch_size: 50
-    stride: 50
+    patch_size: 10
+    stride: 10
+    dropout: 0.1
 
 # ============================================================
 # 数据配置
 # ============================================================
 data:
-  # 数据根目录 (CSV中的路径已包含Data/前缀，故此处设为空)
   data_root: ""
   
-  # 数据集配置
   dataset:
-    csv_path: "Data/LiCu_10C-1/LiCu_10C_1.csv"
-    signal_length: 3000  # 每个信号的采样点数
+    # 使用简化数据集（cycle 1-54，201 样本）
+    csv_path: "Data/LiCu_10C-1/LiCu_10C_1_R_simple.csv"
+    signal_length: 3000
     
-    # 配对采样策略
     pairing:
-      # 最小 cycle 差
-      min_cycle_gap: 10
-      # 最大 cycle 差
+      min_cycle_gap: 5
       max_cycle_gap: 100
-      # 是否使用所有可能的配对
       use_all_pairs: false
   
-  # 潜空间缓存 (加速训练)
+  # 潜空间缓存（使用正确归一化的缓存）
   cache:
     enabled: true
-    cache_dir: "experiments/flow_matching/latent_cache"
+    cache_dir: "experiments/flow_matching/latent_cache_correct"
   
-  # 数据增强
-  augmentation:
-    # 时间抖动
-    time_jitter: 0.01
-    # 噪声注入
-    noise_scale: 0.001
+  # 归一化参数（来自 latest.pth，必须与训练数据一致）
+  normalize:
+    mean: 0.0014818326526033054
+    std: 0.15278572162321524
 
 # ============================================================
 # 训练配置
 # ============================================================
 training:
-  # 基本设置
-  batch_size: 64           # 增大batch_size，利用GPU并行
-  num_epochs: 1
-  num_workers: 4
+  batch_size: 512
+  num_epochs: 100
+  num_workers: 0  # Windows 兼容
   
-  # 优化器
   optimizer:
     type: "adamw"
     lr: 1.0e-4
     weight_decay: 0.01
     betas: [0.9, 0.999]
   
-  # 学习率调度
   scheduler:
-    type: "cosine"  # cosine, linear, constant, warmup_cosine
+    type: "cosine"
     warmup_epochs: 5
     min_lr: 1.0e-6
   
-  # 梯度裁剪
   gradient_clip:
     enabled: true
     max_norm: 1.0
   
-  # EMA (指数移动平均)
   ema:
     enabled: true
     decay: 0.9999
   
-  # 检查点
   checkpoint:
     save_dir: "experiments/flow_matching/checkpoints"
-    save_every: 10  # 每 N 个 epoch 保存
-    keep_last: 5    # 保留最近 N 个检查点
+    save_every: 10
+    keep_last: 3
   
-  # 日志
   logging:
     log_dir: "experiments/flow_matching/logs"
-    log_every: 100  # 每 N 步记录
+    log_every: 50
     use_wandb: false
-    wandb_project: "battery-flow-matching"
 
 # ============================================================
 # 评估配置
 # ============================================================
 evaluation:
-  # 评估频率
-  eval_every: 5  # 每 N 个 epoch 评估
+  eval_every: 5
   
-  # 轨迹预测
   trajectory:
-    num_steps: 100
+    num_steps: 50
     visualize: true
     save_plots: true
-  
-  # 健康评分预测
-  health_score:
-    evaluate: true
-  
-  # Wasserstein 距离
-  wasserstein:
-    evaluate: true
-    num_samples: 1000
 
 # ============================================================
 # 推理配置
 # ============================================================
 inference:
-  # 默认求解器步数
   num_steps: 50
-  
-  # 是否使用 EMA 模型
   use_ema: true
-  
-  # 批处理大小
   batch_size: 64
 
 # ============================================================
 # 实验配置
 # ============================================================
 experiment:
-  name: "battery_flow_v1"
+  name: "battery_flow_v2"
   seed: 42
-  device: "cuda"  # cuda, cpu, auto
+  device: "cuda"
   
-  # 混合精度训练
   mixed_precision:
     enabled: true
-    dtype: "float16"  # float16, bfloat16
+    dtype: "float16"
